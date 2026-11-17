@@ -1,5 +1,5 @@
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
-import { requireStorage } from './config';
+import { requireStorage, storage } from './config';
 
 const ALLOWED_TYPES = [
   'image/jpeg',
@@ -22,7 +22,10 @@ export function validateImageFile(file: File): string | null {
   return null;
 }
 
-async function compressImageToWebP(file: File, maxWidth = 1600): Promise<{ blob: Blob; ext: string }> {
+async function compressImageToWebP(
+  file: File,
+  maxWidth = 1600
+): Promise<{ blob: Blob; ext: string }> {
   if (
     file.type === 'image/svg+xml' ||
     file.type === 'image/x-icon' ||
@@ -69,6 +72,38 @@ async function compressImageToWebP(file: File, maxWidth = 1600): Promise<{ blob:
   });
 }
 
+async function uploadToCloudinary(blob: Blob, fileName: string): Promise<string> {
+  const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
+  const uploadPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
+
+  if (!cloudName || !uploadPreset) {
+    throw new Error('Cloudinary environment variables are missing.');
+  }
+
+  const formData = new FormData();
+  formData.append('file', blob, fileName);
+  formData.append('upload_preset', uploadPreset);
+
+  const response = await fetch(
+    `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`,
+    {
+      method: 'POST',
+      body: formData,
+    }
+  );
+
+  const data = (await response.json()) as {
+    secure_url?: string;
+    error?: { message?: string };
+  };
+
+  if (!response.ok || !data.secure_url) {
+    throw new Error(data.error?.message || 'Cloudinary image upload failed.');
+  }
+
+  return data.secure_url;
+}
+
 export async function uploadImage(
   file: File,
   folder: 'products' | 'banners' | 'ads' | 'branding',
@@ -77,15 +112,28 @@ export async function uploadImage(
   const err = validateImageFile(file);
   if (err) throw new Error(err);
 
-  const storage = requireStorage();
   const { blob, ext } = optimize
     ? await compressImageToWebP(file)
     : { blob: file, ext: file.name.split('.').pop() || 'png' };
 
   const safeBase = file.name.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9-_]/g, '-');
-  const filePath = `${folder}/${Date.now()}-${safeBase}.${ext}`;
-  const storageRef = ref(storage, filePath);
+  const finalName = `${Date.now()}-${safeBase}.${ext}`;
 
+  const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
+  const uploadPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
+
+  if (cloudName && uploadPreset) {
+    return uploadToCloudinary(blob, finalName);
+  }
+
+  if (!storage) {
+    throw new Error(
+      'Image upload is not configured. Add Cloudinary free keys in Vercel Environment Variables.'
+    );
+  }
+
+  const firebaseStorage = requireStorage();
+  const storageRef = ref(firebaseStorage, `${folder}/${finalName}`);
   await uploadBytes(storageRef, blob, {
     contentType: optimize && ext === 'webp' ? 'image/webp' : file.type,
     cacheControl: 'public, max-age=31536000',
@@ -97,8 +145,8 @@ export async function uploadImage(
 export async function deleteStorageFileByUrl(url: string): Promise<void> {
   if (!url || !url.includes('firebasestorage')) return;
   try {
-    const storage = requireStorage();
-    const fileRef = ref(storage, url);
+    const firebaseStorage = requireStorage();
+    const fileRef = ref(firebaseStorage, url);
     await deleteObject(fileRef);
   } catch {
     // Ignore already-deleted or external URLs
